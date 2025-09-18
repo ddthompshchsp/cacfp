@@ -1,77 +1,134 @@
+# Create a robust/debug Streamlit app that helps diagnose why data wasn't detected.
+from textwrap import dedent
+
+debug_app_path = "/mnt/data/meal_count_streamlit_debug.py"
+
+code = dedent(r"""
 import streamlit as st
 import pandas as pd
 import numpy as np
 import re
 from io import BytesIO
 from datetime import datetime
-from openpyxl import load_workbook
+import matplotlib.pyplot as plt
 
-MEAL_LABELS = ["B","L","P"]
+st.set_page_config(page_title="Meal Count Debugger (B/L/P)", layout="wide")
+st.title("🛠️ Meal Count Debugger — Breakfast, Lunch, PM Snack")
 
-def _safe_str(x):
-    try:
-        return str(x) if not pd.isna(x) else ""
-    except Exception:
-        return str(x)
+st.markdown("""
+If your last run produced an *empty spreadsheet*, use this debugger.
+It will auto-detect flexible headers and show you exactly what it found **per sheet**.
+
+**What this app does:**
+- Tries multiple header spellings and positions (not hard-coded).
+- Accepts day names with or without periods (`Mon` or `Mon.`).
+- Accepts meal labels like `B`, `Br`, `Breakfast`, `L`, `Lunch`, `P`, `PM Snack`, `Snack PM`, etc.
+- Counts a **mark** if the cell is **not empty** (number, X, check, etc.), not just strings.
+- Lets you treat **attendance-less** days as present if any meal is marked (optional).
+""")
+
+# --- Normalizers & matching helpers ---
+def norm(s):
+    s = str(s).strip().lower()
+    s = re.sub(r'[^a-z0-9 ]+', '', s)
+    return s
+
+def is_day_token(s):
+    if not isinstance(s, str): return False
+    t = norm(s)
+    for day in ["mon","tue","wed","thu","fri","monday","tuesday","wednesday","thursday","friday"]:
+        if t.startswith(day):
+            return True
+    return False
+
+def meal_label_from_token(s):
+    t = norm(s)
+    # attendance
+    if t.startswith("at") or t.startswith("att") or "attend" in t:
+        return "At"
+    # breakfast
+    if t in ["b","br","bf","breakfast","am snack","amsnack"] or t.startswith("break") or t.startswith("brk"):
+        return "B"
+    # lunch
+    if t in ["l","ln","lunch"] or t.startswith("lun"):
+        return "L"
+    # pm snack
+    if t in ["p","pm","pmsnack","snack pm","snackpm","pm snack","pmmeal","snack"] or "pm" in t and "snack" in t:
+        return "P"
+    return None
+
+def nonempty_mark(x):
+    if pd.isna(x): return False
+    if isinstance(x, str):
+        return len(x.strip()) > 0
+    # numbers/booleans/counts count as marked
+    return True
+
+uploaded = st.file_uploader("Upload your .xlsx workbook", type=["xlsx"])
+assume_attendance_if_any_meal = st.checkbox("If attendance is blank, treat day as present when ANY meal is marked", value=True)
 
 def parse_sheet(df):
-    facility = None
-    class_name = None
-
-    for r in range(0, 30):
-        for c in range(min(df.shape[1], 100)):
-            v = df.iat[r, c]
-            if isinstance(v, str):
-                if r == 7 and c == 3:
-                    facility = v.strip()
-                if "Class" in v:
-                    m = re.search(r"Class\s*([A-Za-z0-9]+)", v, re.IGNORECASE)
-                    if m:
-                        class_name = m.group(1)
-
-    day_row = label_row = None
-    for r in range(8, min(60, df.shape[0])):
-        row_vals = df.iloc[r].tolist()
-        if any(isinstance(x, str) and x.strip().endswith(".") for x in row_vals):
+    # 1) Find day row (first row that has >=2 day tokens)
+    day_row = None
+    for r in range(min(80, df.shape[0])):
+        tokens = [is_day_token(v) for v in df.iloc[r].tolist()]
+        if sum(tokens) >= 2:
             day_row = r
-            label_row = r + 1
             break
-    if day_row is None or label_row is None:
-        return None
+    if day_row is None:
+        return None, "No day row found"
 
+    # 2) Find label row = next non-empty row
+    label_row = None
+    for r in range(day_row+1, min(day_row+6, df.shape[0])):
+        row_vals = df.iloc[r].tolist()
+        if any((isinstance(x, str) and x.strip()) or (not pd.isna(x)) for x in row_vals):
+            label_row = r
+            break
+    if label_row is None:
+        return None, "No label row found after day row"
+
+    # 3) Build day blocks by locating day tokens in day_row
     day_starts = []
     for c in range(df.shape[1]):
-        day = df.iat[day_row, c]
-        if isinstance(day, str) and day.strip().endswith("."):
-            day_starts.append((c, day.strip().rstrip(".")))
+        v = df.iat[day_row, c]
+        if is_day_token(v):
+            # Canonicalize label to Mon/Tue/.. short form
+            t = norm(v)
+            short = v.strip().split()[0].rstrip('.')
+            day_starts.append((c, short))
     if not day_starts:
-        return None
+        return None, "Could not locate day start columns"
+    day_starts.sort()
 
+    # 4) Within each day-block, map label cells on label_row to At/B/L/P
     blocks = {}
-    day_starts_sorted = sorted(day_starts)
-    for i, (c, dayname) in enumerate(day_starts_sorted):
-        end = day_starts_sorted[i+1][0] if i+1 < len(day_starts_sorted) else df.shape[1]
+    for i, (c, day) in enumerate(day_starts):
+        end = day_starts[i+1][0] if i+1 < len(day_starts) else df.shape[1]
         labels = []
         for cc in range(c, end):
             val = df.iat[label_row, cc]
-            if isinstance(val, str) and val.strip() in (["At"] + MEAL_LABELS):
-                labels.append((cc, val.strip()))
-        labels = sorted(labels, key=lambda x: x[0])
+            if isinstance(val, str) or not pd.isna(val):
+                ml = meal_label_from_token(val)
+                if ml in ["At","B","L","P"]:
+                    labels.append((cc, ml))
         if labels:
-            blocks[dayname] = labels
-    if not blocks:
-        return None
+            blocks[day] = sorted(labels, key=lambda x: x[0])
 
+    if not blocks:
+        return None, "Found day row but no meal/attendance labels underneath"
+
+    # 5) Find start of student rows: look for first row below label_row with a non-empty name col (col1) and any mark in the block
     start_row = None
-    for r in range(label_row + 1, min(label_row + 200, df.shape[0])):
-        v0 = df.iat[r, 0]
-        v1 = df.iat[r, 1]
-        if (isinstance(v0, (int, float)) and not pd.isna(v0)) and isinstance(v1, str) and v1.strip():
+    for r in range(label_row+1, min(label_row+200, df.shape[0])):
+        name_cell = df.iat[r, 1] if df.shape[1] > 1 else None
+        if isinstance(name_cell, str) and name_cell.strip():
             start_row = r
             break
     if start_row is None:
-        return None
+        return None, "No student rows detected"
 
+    # 6) Find end of student rows: first mostly empty row
     end_row = start_row
     for r in range(start_row, df.shape[0]):
         row = df.iloc[r, 0:10]
@@ -79,116 +136,106 @@ def parse_sheet(df):
             end_row = r - 1
             break
     if end_row < start_row:
-        end_row = min(start_row + 80, df.shape[0] - 1)
+        end_row = min(start_row + 60, df.shape[0]-1)
 
-    students_df = df.iloc[start_row:end_row+1, :].copy()
+    students = df.iloc[start_row:end_row+1, :].copy()
 
+    # 7) Count marks
     rows = []
     for day, cols in blocks.items():
-        att_cols = [col for col, label in cols if label == "At"]
-        att_marked = 0
+        # Attendance
+        att_cols = [col for col, lab in cols if lab == "At"]
+        att_present = 0
         if att_cols:
-            col_vals = students_df.iloc[:, att_cols[0]]
-            att_marked = int(col_vals.apply(lambda x: isinstance(x, str) and x.strip() != "").sum())
-        for col_idx, label in cols:
-            if label in MEAL_LABELS:
-                col_vals = students_df.iloc[:, col_idx]
-                marked = int(col_vals.apply(lambda x: isinstance(x, str) and x.strip() != "").sum())
-                rows.append({"Day": day, "Meal": label, "MarkedCount": marked, "AttendanceMarked": att_marked})
+            att_col = students.iloc[:, att_cols[0]]
+            att_present = int(att_col.apply(nonempty_mark).sum())
 
-    counts = pd.DataFrame(rows)
+        # If requested: infer attendance from any meal marks
+        if att_present == 0 and assume_attendance_if_any_meal:
+            meal_cols = [col for col, lab in cols if lab in ["B","L","P"]]
+            if meal_cols:
+                any_meal = students.iloc[:, meal_cols].applymap(nonempty_mark).any(axis=1).sum()
+                att_present = int(any_meal)
 
-    week_dates = []
-    date_label_row = day_row - 1
-    for c in range(df.shape[1]):
-        if _safe_str(df.iat[date_label_row, c]).strip() == "Date":
-            for rr in range(date_label_row + 1, date_label_row + 3):
-                val = df.iat[rr, c]
-                try:
-                    dt = pd.to_datetime(val)
-                    if not pd.isna(dt):
-                        week_dates.append(dt)
-                        break
-                except Exception:
-                    continue
-    week_start = min(week_dates).date() if week_dates else None
-    week_end   = max(week_dates).date() if week_dates else None
+        for col_idx, lab in cols:
+            if lab in ["B","L","P"]:
+                col_vals = students.iloc[:, col_idx]
+                marks = int(col_vals.apply(nonempty_mark).sum())
+                rows.append({"Day": day, "Meal": lab, "MarkedCount": marks, "AttendanceMarked": att_present})
+    result = pd.DataFrame(rows)
 
-    return {"Campus": facility or "Unknown Campus",
-            "Class": class_name or "Unknown Class",
-            "WeekStart": week_start,
-            "WeekEnd": week_end,
-            "Counts": counts,
-            "StudentRows": (start_row, end_row)}
+    # Try to scrape week start by scanning above the day row for a date-like value
+    week_start = None
+    for r in range(max(0, day_row-5), day_row+1):
+        for c in range(df.shape[1]):
+            v = df.iat[r, c]
+            try:
+                dt = pd.to_datetime(v, errors="coerce")
+                if pd.notna(dt):
+                    if week_start is None or dt < week_start:
+                        week_start = dt
+            except Exception:
+                pass
 
-def build_report(file_bytes):
-    xls = pd.ExcelFile(file_bytes)
+    info = {
+        "day_row": day_row,
+        "label_row": label_row,
+        "start_row": start_row,
+        "end_row": end_row,
+        "blocks": blocks,
+        "week_start": str(week_start.date()) if isinstance(week_start, pd.Timestamp) else None
+    }
+    return (result, info), None
+
+def build_all(file_like):
+    xls = pd.ExcelFile(file_like)
+    debug = []
     all_records = []
     for s in xls.sheet_names:
-        df = pd.read_excel(file_bytes, sheet_name=s, header=None)
-        parsed = parse_sheet(df)
-        if not parsed or parsed["Counts"].empty:
+        df = pd.read_excel(file_like, sheet_name=s, header=None)
+        parsed, err = parse_sheet(df)
+        if err:
+            debug.append({"Sheet": s, "Status": "ERROR", "Detail": err})
             continue
-        campus = parsed["Campus"]
-        cls = parsed["Class"]
-        wk = f"{parsed['WeekStart']} to {parsed['WeekEnd']}" if parsed["WeekStart"] else "Unknown Week"
-        counts = parsed["Counts"].copy()
-        counts["Issue"] = (counts["MarkedCount"] == 0) & (counts["AttendanceMarked"] > 0)
+        (counts, info) = parsed
+        debug.append({"Sheet": s, "Status": "OK", "Detail": info})
         for _, row in counts.iterrows():
             all_records.append({
-                "Campus": campus,
-                "Class": cls,
-                "Week": wk,
+                "Sheet": s,
                 "Day": row["Day"],
                 "Meal": row["Meal"],
                 "MarkedCount": int(row["MarkedCount"]),
-                "AttendanceMarked": int(row["AttendanceMarked"]),
-                "Issue_MissingRecording": bool(row["Issue"]),
+                "AttendanceMarked": int(row["AttendanceMarked"])
             })
-    summary_df = pd.DataFrame(all_records)
+    return pd.DataFrame(all_records), pd.DataFrame(debug)
+
+def make_excel(summary, debug_df):
     out = BytesIO()
     with pd.ExcelWriter(out, engine="xlsxwriter") as writer:
-        if summary_df.empty:
-            pd.DataFrame(columns=["Campus","Month","MissingMealRecordings","Pct_Days_All3MealsRecorded"]).to_excel(writer, sheet_name="Dashboard_Month", index=False)
-            pd.DataFrame(columns=["Campus","Month","Week","MissingMealRecordings","Pct_Days_All3MealsRecorded"]).to_excel(writer, sheet_name="Dashboard_Month_Week", index=False)
-            summary_df.to_excel(writer, sheet_name="Summary_All", index=False)
-        else:
-            def parse_week_start(s):
-                try:
-                    if isinstance(s, str) and "to" in s:
-                        start = s.split("to")[0].strip()
-                        return pd.to_datetime(start).date()
-                except Exception:
-                    return pd.NaT
-                return pd.NaT
-            summary_df["WeekStart"] = summary_df["Week"].apply(parse_week_start)
-            summary_df["Month"] = pd.to_datetime(summary_df["WeekStart"]).dt.to_period("M").astype(str)
-            miss = summary_df[summary_df["Issue_MissingRecording"] == True]
-            campus_month_missing = (miss.groupby(["Campus","Month"]).size().reset_index(name="MissingMealRecordings"))
-            meals3 = summary_df[summary_df["Meal"].isin(MEAL_LABELS)].copy()
-            daily_ok = (meals3.groupby(["Campus","Class","Week","WeekStart","Month","Day"])["MarkedCount"]
-                              .apply(lambda s: int((s > 0).sum() == 3))
-                              .reset_index(name="All3MealsRecorded"))
-            campus_month_kpi = (daily_ok.groupby(["Campus","Month"])["All3MealsRecorded"].mean().reset_index(name="Pct_Days_All3MealsRecorded"))
-            dash_month = pd.merge(campus_month_missing, campus_month_kpi, on=["Campus","Month"], how="outer") \
-                            .fillna({"MissingMealRecordings":0,"Pct_Days_All3MealsRecorded":0})
-            campus_week_missing = (miss.groupby(["Campus","Month","Week"]).size().reset_index(name="MissingMealRecordings"))
-            campus_week_kpi = (daily_ok.groupby(["Campus","Month","Week"])["All3MealsRecorded"].mean().reset_index(name="Pct_Days_All3MealsRecorded"))
-            dash_month_week = pd.merge(campus_week_missing, campus_week_kpi, on=["Campus","Month","Week"], how="outer") \
-                                 .fillna({"MissingMealRecordings":0,"Pct_Days_All3MealsRecorded":0})
-            # Write
-            dash_month.sort_values(["Month","Campus"]).to_excel(writer, sheet_name="Dashboard_Month", index=False)
-            dash_month_week.sort_values(["Month","Week","Campus"]).to_excel(writer, sheet_name="Dashboard_Month_Week", index=False)
-            summary_df.to_excel(writer, sheet_name="Summary_All", index=False)
+        debug_df.to_excel(writer, sheet_name="Debug_Log", index=False)
+        summary.to_excel(writer, sheet_name="Extracted_Counts", index=False)
     out.seek(0)
     return out
 
-st.set_page_config(page_title="Meal Count Monitoring (B/L/P)", layout="wide")
-st.title("Meal Count Monitoring (Breakfast, Lunch, PM Snack)")
-
-uploaded = st.file_uploader("Upload the Weekly Forms workbook (.xlsx)", type=["xlsx"])
+uploaded = st.file_uploader("Upload the workbook to debug", type=["xlsx"])
 if uploaded:
-    if st.button("Generate Monitoring Report"):
-        report_bytes = build_report(uploaded)
-        st.success("Report generated.")
-        st.download_button("Download Excel Report", report_bytes, file_name="MealCount_Full_Report.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    with st.spinner("Scanning sheets and detecting headers..."):
+        summary, debug_df = build_all(uploaded)
+
+    st.subheader("🔎 Debug Log (per sheet)")
+    st.dataframe(debug_df, use_container_width=True, height=300)
+
+    st.subheader("✅ Extracted Counts (raw)")
+    st.dataframe(summary.head(1000), use_container_width=True, height=400)
+
+    st.download_button("Download Debug Excel", make_excel(summary, debug_df), file_name="MealCount_Debug_Output.xlsx",
+                       mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+else:
+    st.info("Upload your Excel to diagnose parsing issues.")
+""")
+
+with open(debug_app_path, "w", encoding="utf-8") as f:
+    f.write(code)
+
+debug_app_path
+
