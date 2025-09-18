@@ -1,234 +1,194 @@
-import io
-import re
-from datetime import datetime
-from pathlib import Path
-
-import pandas as pd
 import streamlit as st
-import pytz
+import pandas as pd
+import numpy as np
+import re
+from io import BytesIO
+from datetime import datetime
+from openpyxl import load_workbook
 
-from openpyxl import Workbook, load_workbook
-from openpyxl.styles import Alignment, Font
-from openpyxl.utils import get_column_letter, column_index_from_string
-from openpyxl.worksheet.table import Table, TableStyleInfo
-from openpyxl.drawing.image import Image as XLImage
+MEAL_LABELS = ["B","L","P"]
 
-st.set_page_config(page_title="CACFP Roster — Initial Report Extractor", layout="wide")
-
-# ---------------- Header (logo+title) ----------------
-logo_path = Path("header_logo.png")
-hdr_l, hdr_c, hdr_r = st.columns([1, 2, 1])
-with hdr_c:
-    if logo_path.exists():
-        st.image(str(logo_path), width=320)
-    st.markdown(
-        """
-        <h1 style='text-align:center; margin: 8px 0 4px;'>CACFP Roster — Initial Report Extractor</h1>
-        <p style='text-align:center; font-size:16px; margin-top:0;'>
-        Upload the initial (tabular) report. We'll auto-detect the header row and map the columns.<br>
-        Missing fields → <b style='color:#C00000'>red ✗</b>. Enrollment Date after Parent/Guardian Date → <b style='color:#C00000'>red</b>.
-        </p>
-        """,
-        unsafe_allow_html=True,
-    )
-st.divider()
-
-TARGET_COLS = [
-    "PID",
-    "First Name",
-    "Last Name",
-    "Center",
-    "Enrollment Date",
-    "Parent Signature",
-    "Parent/Guardian Name",
-    "Parent/Guardian Date",
-    "Staff Signature",
-    "Staff Name",
-    "Staff Date",
-]
-
-DATE_PAT = r"(\d{1,2}[/\-]\d{1,2}[/\-]\d{2,4})"
-RED = "C00000"
-
-def _clean_date(s):
-    if s is None or (isinstance(s, float) and pd.isna(s)) or (isinstance(s, str) and s.strip() == ""):
-        return ""
+def _safe_str(x):
     try:
-        dt = pd.to_datetime(str(s), errors="coerce")
-        if pd.isna(dt):
-            m = re.search(DATE_PAT, str(s))
-            if not m:
-                return ""
-            dt = pd.to_datetime(m.group(1), errors="coerce")
-        return dt.strftime("%m/%d/%Y")
+        return str(x) if not pd.isna(x) else ""
     except Exception:
-        m = re.search(DATE_PAT, str(s))
-        return m.group(1) if m else ""
+        return str(x)
 
-def _split_name(full):
-    if not full or not str(full).strip():
-        return "", ""
-    parts = str(full).strip().split()
-    if len(parts) == 1:
-        return parts[0], ""
-    return " ".join(parts[:-1]), parts[-1]
+def parse_sheet(df):
+    facility = None
+    class_name = None
 
-def _rename_columns(cols):
-    mapping = {}
-    for c in cols:
-        s = str(c).strip()
-        sl = s.lower()
-        if re.search(r"\bparticipant\b.*\bpid\b|\bpid\b", sl):
-            mapping[c] = "PID"
-        elif re.search(r"\bchild\b.*\bname\b|\bname of child\b|\bchildname\b", sl):
-            mapping[c] = "Child Name"
-        elif re.search(r"\bfirst\b.*\bname\b", sl):
-            mapping[c] = "First Name"
-        elif re.search(r"\blast\b.*\bname\b", sl):
-            mapping[c] = "Last Name"
-        elif re.search(r"\bcenter\b|\bschool\b", sl):
-            mapping[c] = "Center"
-        elif re.search(r"\benrollment\b.*\bdate\b|\bentry\b.*\bdate\b", sl):
-            mapping[c] = "Enrollment Date"
-        elif re.search(r"\bparent\b.*\bguardian\b.*\bname\b", sl):
-            mapping[c] = "Parent/Guardian Name"
-        elif re.search(r"\bparent\b.*\bguardian\b.*\bdate\b", sl):
-            mapping[c] = "Parent/Guardian Date"
-        elif re.search(r"\bstaff\b.*\bname\b", sl):
-            mapping[c] = "Staff Name"
-        elif re.search(r"\bstaff\b.*\bdate\b", sl):
-            mapping[c] = "Staff Date"
-        elif re.search(r"\bparent\b.*signature|\bparent/guardian\b.*signature", sl):
-            mapping[c] = "Parent Signature"
-        elif re.search(r"\bstaff\b.*signature", sl):
-            mapping[c] = "Staff Signature"
+    for r in range(0, 30):
+        for c in range(min(df.shape[1], 100)):
+            v = df.iat[r, c]
+            if isinstance(v, str):
+                if r == 7 and c == 3:
+                    facility = v.strip()
+                if "Class" in v:
+                    m = re.search(r"Class\s*([A-Za-z0-9]+)", v, re.IGNORECASE)
+                    if m:
+                        class_name = m.group(1)
+
+    day_row = label_row = None
+    for r in range(8, min(60, df.shape[0])):
+        row_vals = df.iloc[r].tolist()
+        if any(isinstance(x, str) and x.strip().endswith(".") for x in row_vals):
+            day_row = r
+            label_row = r + 1
+            break
+    if day_row is None or label_row is None:
+        return None
+
+    day_starts = []
+    for c in range(df.shape[1]):
+        day = df.iat[day_row, c]
+        if isinstance(day, str) and day.strip().endswith("."):
+            day_starts.append((c, day.strip().rstrip(".")))
+    if not day_starts:
+        return None
+
+    blocks = {}
+    day_starts_sorted = sorted(day_starts)
+    for i, (c, dayname) in enumerate(day_starts_sorted):
+        end = day_starts_sorted[i+1][0] if i+1 < len(day_starts_sorted) else df.shape[1]
+        labels = []
+        for cc in range(c, end):
+            val = df.iat[label_row, cc]
+            if isinstance(val, str) and val.strip() in (["At"] + MEAL_LABELS):
+                labels.append((cc, val.strip()))
+        labels = sorted(labels, key=lambda x: x[0])
+        if labels:
+            blocks[dayname] = labels
+    if not blocks:
+        return None
+
+    start_row = None
+    for r in range(label_row + 1, min(label_row + 200, df.shape[0])):
+        v0 = df.iat[r, 0]
+        v1 = df.iat[r, 1]
+        if (isinstance(v0, (int, float)) and not pd.isna(v0)) and isinstance(v1, str) and v1.strip():
+            start_row = r
+            break
+    if start_row is None:
+        return None
+
+    end_row = start_row
+    for r in range(start_row, df.shape[0]):
+        row = df.iloc[r, 0:10]
+        if row.isna().sum() >= 8:
+            end_row = r - 1
+            break
+    if end_row < start_row:
+        end_row = min(start_row + 80, df.shape[0] - 1)
+
+    students_df = df.iloc[start_row:end_row+1, :].copy()
+
+    rows = []
+    for day, cols in blocks.items():
+        att_cols = [col for col, label in cols if label == "At"]
+        att_marked = 0
+        if att_cols:
+            col_vals = students_df.iloc[:, att_cols[0]]
+            att_marked = int(col_vals.apply(lambda x: isinstance(x, str) and x.strip() != "").sum())
+        for col_idx, label in cols:
+            if label in MEAL_LABELS:
+                col_vals = students_df.iloc[:, col_idx]
+                marked = int(col_vals.apply(lambda x: isinstance(x, str) and x.strip() != "").sum())
+                rows.append({"Day": day, "Meal": label, "MarkedCount": marked, "AttendanceMarked": att_marked})
+
+    counts = pd.DataFrame(rows)
+
+    week_dates = []
+    date_label_row = day_row - 1
+    for c in range(df.shape[1]):
+        if _safe_str(df.iat[date_label_row, c]).strip() == "Date":
+            for rr in range(date_label_row + 1, date_label_row + 3):
+                val = df.iat[rr, c]
+                try:
+                    dt = pd.to_datetime(val)
+                    if not pd.isna(dt):
+                        week_dates.append(dt)
+                        break
+                except Exception:
+                    continue
+    week_start = min(week_dates).date() if week_dates else None
+    week_end   = max(week_dates).date() if week_dates else None
+
+    return {"Campus": facility or "Unknown Campus",
+            "Class": class_name or "Unknown Class",
+            "WeekStart": week_start,
+            "WeekEnd": week_end,
+            "Counts": counts,
+            "StudentRows": (start_row, end_row)}
+
+def build_report(file_bytes):
+    xls = pd.ExcelFile(file_bytes)
+    all_records = []
+    for s in xls.sheet_names:
+        df = pd.read_excel(file_bytes, sheet_name=s, header=None)
+        parsed = parse_sheet(df)
+        if not parsed or parsed["Counts"].empty:
+            continue
+        campus = parsed["Campus"]
+        cls = parsed["Class"]
+        wk = f"{parsed['WeekStart']} to {parsed['WeekEnd']}" if parsed["WeekStart"] else "Unknown Week"
+        counts = parsed["Counts"].copy()
+        counts["Issue"] = (counts["MarkedCount"] == 0) & (counts["AttendanceMarked"] > 0)
+        for _, row in counts.iterrows():
+            all_records.append({
+                "Campus": campus,
+                "Class": cls,
+                "Week": wk,
+                "Day": row["Day"],
+                "Meal": row["Meal"],
+                "MarkedCount": int(row["MarkedCount"]),
+                "AttendanceMarked": int(row["AttendanceMarked"]),
+                "Issue_MissingRecording": bool(row["Issue"]),
+            })
+    summary_df = pd.DataFrame(all_records)
+    out = BytesIO()
+    with pd.ExcelWriter(out, engine="xlsxwriter") as writer:
+        if summary_df.empty:
+            pd.DataFrame(columns=["Campus","Month","MissingMealRecordings","Pct_Days_All3MealsRecorded"]).to_excel(writer, sheet_name="Dashboard_Month", index=False)
+            pd.DataFrame(columns=["Campus","Month","Week","MissingMealRecordings","Pct_Days_All3MealsRecorded"]).to_excel(writer, sheet_name="Dashboard_Month_Week", index=False)
+            summary_df.to_excel(writer, sheet_name="Summary_All", index=False)
         else:
-            mapping[c] = s
-    return [mapping[c] for c in cols]
+            def parse_week_start(s):
+                try:
+                    if isinstance(s, str) and "to" in s:
+                        start = s.split("to")[0].strip()
+                        return pd.to_datetime(start).date()
+                except Exception:
+                    return pd.NaT
+                return pd.NaT
+            summary_df["WeekStart"] = summary_df["Week"].apply(parse_week_start)
+            summary_df["Month"] = pd.to_datetime(summary_df["WeekStart"]).dt.to_period("M").astype(str)
+            miss = summary_df[summary_df["Issue_MissingRecording"] == True]
+            campus_month_missing = (miss.groupby(["Campus","Month"]).size().reset_index(name="MissingMealRecordings"))
+            meals3 = summary_df[summary_df["Meal"].isin(MEAL_LABELS)].copy()
+            daily_ok = (meals3.groupby(["Campus","Class","Week","WeekStart","Month","Day"])["MarkedCount"]
+                              .apply(lambda s: int((s > 0).sum() == 3))
+                              .reset_index(name="All3MealsRecorded"))
+            campus_month_kpi = (daily_ok.groupby(["Campus","Month"])["All3MealsRecorded"].mean().reset_index(name="Pct_Days_All3MealsRecorded"))
+            dash_month = pd.merge(campus_month_missing, campus_month_kpi, on=["Campus","Month"], how="outer") \
+                            .fillna({"MissingMealRecordings":0,"Pct_Days_All3MealsRecorded":0})
+            campus_week_missing = (miss.groupby(["Campus","Month","Week"]).size().reset_index(name="MissingMealRecordings"))
+            campus_week_kpi = (daily_ok.groupby(["Campus","Month","Week"])["All3MealsRecorded"].mean().reset_index(name="Pct_Days_All3MealsRecorded"))
+            dash_month_week = pd.merge(campus_week_missing, campus_week_kpi, on=["Campus","Month","Week"], how="outer") \
+                                 .fillna({"MissingMealRecordings":0,"Pct_Days_All3MealsRecorded":0})
+            # Write
+            dash_month.sort_values(["Month","Campus"]).to_excel(writer, sheet_name="Dashboard_Month", index=False)
+            dash_month_week.sort_values(["Month","Week","Campus"]).to_excel(writer, sheet_name="Dashboard_Month_Week", index=False)
+            summary_df.to_excel(writer, sheet_name="Summary_All", index=False)
+    out.seek(0)
+    return out
 
-def _detect_header_row(df):
-    for r in range(min(60, len(df))):
-        row = df.iloc[r, :].astype(str).str.strip().str.lower().tolist()
-        hits = sum(
-            1 for x in row if re.search(
-                r"pid|participant|child.*name|first.*name|last.*name|center|school|enrollment.*date|parent/guardian|staff|date|signature", x
-            )
-        )
-        if hits >= 3:
-            return r
-    return 0
+st.set_page_config(page_title="Meal Count Monitoring (B/L/P)", layout="wide")
+st.title("Meal Count Monitoring (Breakfast, Lunch, PM Snack)")
 
-def _export(df: pd.DataFrame) -> bytes:
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "CACFP Roster"
-
-    header_row = 3
-    data_row0 = header_row + 1
-
-    tz = pytz.timezone("America/Chicago")
-    now_str = datetime.now(tz).strftime("%m/%d/%Y %I:%M %p CT")
-    ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=len(TARGET_COLS))
-    ws["A1"] = f"CACFP Enrollment Roster — Exported {now_str}"
-    ws["A1"].font = Font(bold=True, size=14)
-    ws["A1"].alignment = Alignment(horizontal="center", vertical="center")
-
-    for j, col in enumerate(TARGET_COLS, start=1):
-        ws.cell(row=header_row, column=j, value=col).alignment = Alignment(horizontal="center", vertical="center")
-
-    col_idx = {name: TARGET_COLS.index(name) + 1 for name in TARGET_COLS}
-
-    for i, rec in df.iterrows():
-        r = data_row0 + i
-        for name in TARGET_COLS:
-            val = str(rec.get(name) or "")
-            cell = ws.cell(row=r, column=col_idx[name], value=val if val else "✗")
-            if not val:
-                cell.font = Font(bold=True, color=RED)
-                cell.alignment = Alignment(horizontal="center", vertical="center")
-            else:
-                cell.alignment = Alignment(vertical="center")
-        # Validation
-        try:
-            ed = pd.to_datetime(rec.get("Enrollment Date"), errors="coerce")
-            pd1 = pd.to_datetime(rec.get("Parent/Guardian Date"), errors="coerce")
-            if pd.notna(ed) and pd.notna(pd1) and ed > pd1:
-                ws.cell(row=r, column=col_idx["Enrollment Date"]).font = Font(bold=True, color=RED)
-        except Exception:
-            pass
-
-    # Table + banding + filters
-    ref = f"A{header_row}:{get_column_letter(len(TARGET_COLS))}{ws.max_row}"
-    table = Table(displayName="CACFPRoster", ref=ref)
-    table.tableStyleInfo = TableStyleInfo(name="TableStyleMedium2", showRowStripes=True, showColumnStripes=False)
-    ws.add_table(table)
-
-    ws.freeze_panes = f"A{data_row0}"
-
-    # autosize
-    for col in range(1, len(TARGET_COLS) + 1):
-        letter = get_column_letter(col)
-        max_len = len(str(ws.cell(row=header_row, column=col).value) or "")
-        for r in range(data_row0, ws.max_row + 1):
-            v = ws.cell(row=r, column=col).value
-            if v is None:
-                continue
-            max_len = max(max_len, len(str(v)))
-        ws.column_dimensions[letter].width = min(max_len + 3, 48)
-
-    bio = io.BytesIO()
-    wb.save(bio)
-    bio.seek(0)
-    return bio.getvalue()
-
-# ---------------- UI: Upload + parsing options ----------------
-up = st.file_uploader("Upload the initial (tabular) report (.xlsx)", type=["xlsx"])
-
-if up:
-    # Read sheet names
-    xls = pd.ExcelFile(up)
-    sheet = st.selectbox("Pick the sheet that has the roster table:", xls.sheet_names)
-
-    raw = pd.read_excel(up, sheet_name=sheet, header=None, dtype=str)
-    guess = _detect_header_row(raw)
-    hdr = st.number_input("Header row (0-indexed)", min_value=0, max_value=max(0, len(raw)-1), value=int(guess), step=1,
-                          help="This is the row index where the column labels are.")
-
-    # Parse using the chosen header row
-    df = pd.read_excel(up, sheet_name=sheet, header=int(hdr), dtype=str)
-    df = df.dropna(axis=1, how="all").dropna(how="all")
-    df.columns = _rename_columns(df.columns)
-
-    # If only Child Name provided, split into First/Last
-    if "Child Name" in df.columns and ("First Name" not in df.columns or "Last Name" not in df.columns):
-        fn, ln = zip(*[ _split_name(v) for v in df["Child Name"].tolist() ])
-        if "First Name" not in df.columns:
-            df["First Name"] = list(fn)
-        if "Last Name" not in df.columns:
-            df["Last Name"] = list(ln)
-
-    # Normalize common date fields
-    for col in ["Enrollment Date", "Parent/Guardian Date", "Staff Date"]:
-        if col in df.columns:
-            df[col] = df[col].map(_clean_date)
-
-    # Build final frame
-    out = pd.DataFrame()
-    for col in TARGET_COLS:
-        out[col] = df[col] if col in df.columns else ""
-
-    st.subheader("Preview")
-    st.dataframe(out[["PID","First Name","Last Name","Center","Enrollment Date","Parent/Guardian Name","Parent/Guardian Date","Staff Name","Staff Date"]].head(20),
-                 use_container_width=True)
-
-    xlsx = _export(out)
-    st.success(f"Parsed {len(out):,} rows from '{sheet}'.")
-    st.download_button(
-        "⬇️ Download CACFP Roster (.xlsx)",
-        data=xlsx,
-        file_name=f"CACFP_Roster_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    )
-
-else:
-    st.info("Upload the initial report (.xlsx) to begin.")
+uploaded = st.file_uploader("Upload the Weekly Forms workbook (.xlsx)", type=["xlsx"])
+if uploaded:
+    if st.button("Generate Monitoring Report"):
+        report_bytes = build_report(uploaded)
+        st.success("Report generated.")
+        st.download_button("Download Excel Report", report_bytes, file_name="MealCount_Full_Report.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
