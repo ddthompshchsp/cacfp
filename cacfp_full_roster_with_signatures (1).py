@@ -1,4 +1,4 @@
-# Create a robust/debug Streamlit app that helps diagnose why data wasn't detected.
+
 from textwrap import dedent
 
 debug_app_path = "/mnt/data/meal_count_streamlit_debug.py"
